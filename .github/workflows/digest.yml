@@ -38,8 +38,12 @@ jobs:
 
       - name: Save headlines memory back to the repo
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f last_headlines.txt
-          git diff --cached --quiet || git commit -m "Update headlines memory"
-          git push
+          if [ -f last_headlines.txt ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add -f last_headlines.txt
+            git diff --cached --quiet || git commit -m "Update headlines memory"
+            git push
+          else
+            echo "No headlines file this run (off-week) -- nothing to save."
+          fi
