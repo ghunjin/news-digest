@@ -1,0 +1,45 @@
+name: Biweekly news digest
+
+on:
+  schedule:
+    - cron: "37 0 * * 3"   # 00:37 UTC Wednesday = 9:37 AM Wednesday in Seoul
+  workflow_dispatch:        # adds a manual "Run workflow" button
+    inputs:
+      force:
+        description: "Run even on an off-week"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write           # lets the run save last_headlines.txt back
+
+env:
+  TZ: Asia/Seoul            # the cloud machine thinks in Seoul time
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install anthropic python-dotenv requests
+
+      - name: Run the digest
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python digest.py ${{ inputs.force && '--force' || '' }}
+
+      - name: Save headlines memory back to the repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f last_headlines.txt
+          git diff --cached --quiet || git commit -m "Update headlines memory"
+          git push
