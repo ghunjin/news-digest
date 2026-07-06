@@ -66,12 +66,13 @@ STYLE_INSTRUCTION = (
     "in the separate 'Why it matters' line, not here."
 )
 
-# Gather model. Sonnet follows the format rules and the date window more
-# reliably; token cost is ~3x Haiku (run ~$0.40-0.50 vs ~$0.22 -- search
-# fees are flat either way). Reverting is exactly this: swap which line
-# is commented out.
+# Gather model. Sonnet follows the format rules and the date window far more
+# reliably (a Haiku A/B run on 2026-07-06 violated the date cutoff on half
+# its stories and broke the output format); token cost is ~3x Haiku
+# (~$1/run vs ~$0.22 -- search fees are flat either way). Reverting is
+# exactly this: swap which line is commented out.
 SEARCH_MODEL = "claude-sonnet-4-6"
-# SEARCH_MODEL = "claude-haiku-4-5-20251001"   # cheaper, good enough most weeks
+# SEARCH_MODEL = "claude-haiku-4-5-20251001"   # cheaper, weaker instruction-following
 
 SYNTHESIS_MODEL = "claude-sonnet-4-6"        # better at cross-event reasoning
 
@@ -86,6 +87,23 @@ BIWEEKLY_ANCHOR = date(2026, 7, 8)
 # (which requires a Source: line) never deletes the mentions, and the
 # mentions never leak into last_headlines.txt.
 MENTIONS_SENTINEL = "---HONORABLE MENTIONS---"
+
+# What a story HEADLINE looks like, regardless of exact model formatting:
+# up to ~10 characters of prefix (an emoji and a space, or nothing), then a
+# **bold** chunk, then a (date) in parentheses at the end of the line.
+# Matches both the requested format:   **🚀 Headline** (June 25, 2026)
+# and the drifted variant seen from Haiku: 🚀 **Headline** (June 25, 2026)
+# but NOT planning junk like:          **SpaceX IPO** - Within 14 days
+# (no trailing parenthesized date). Anchoring on the SHAPE of a headline,
+# instead of assuming the line starts with **, is what makes the parser
+# survive small format drift -- the v2 parser assumed a ** start and was
+# silently defeated by a single emoji placed outside the bold markers.
+HEADLINE_RE = re.compile(r"^.{0,10}\*\*.+\*\*\s*\(.+\)\s*$")
+
+
+def is_headline(line: str) -> bool:
+    """True if this line has the shape of a story headline."""
+    return bool(HEADLINE_RE.match(line.strip()))
 
 
 def is_on_week(today: date) -> bool:
@@ -108,21 +126,31 @@ def save_headlines(headlines: str) -> None:
 
 
 def extract_stories(text: str) -> str:
-    """Keep only real stories: segments that contain a Source: line.
+    """Keep only real stories; drop narration and planning junk.
 
-    The model sometimes narrates its planning in bold lines ("**SpaceX IPO**
-    - Within 14 days") despite instructions. A positional trim can't remove
-    that junk, because it also starts with **. But planning junk never has a
-    Source: line, and every real story does (we require it in the prompt).
+    Strategy (v3): find every line shaped like a headline (see HEADLINE_RE),
+    carve the text into segments from one headline to the next, and keep a
+    segment only if it contains a "Source:" line. Two independent locks:
+    narration before the first headline is discarded by construction, and a
+    headline-shaped junk line without a real story under it fails the
+    Source: check.
 
-    So: split the text at every line that begins with ** — the (?=...) is a
-    lookahead, meaning "split at a newline that is FOLLOWED by **, but leave
-    the ** attached to the next segment." Then keep only the segments that
-    mention a source. Everything else (narration, planning lists, closing
-    remarks) is dropped.
+    Fallback: if NO headline-shaped lines are found at all (severe format
+    drift), keep the whole text when it mentions a source rather than
+    silently returning nothing -- a messy digest beats a vanished one.
     """
-    segments = re.split(r"\n(?=\*\*)", text)
-    stories = [s.strip() for s in segments if "Source:" in s]
+    lines = text.splitlines()
+    headline_idxs = [i for i, line in enumerate(lines) if is_headline(line)]
+
+    if not headline_idxs:
+        return text.strip() if "Source:" in text else ""
+
+    stories = []
+    for n, start in enumerate(headline_idxs):
+        end = headline_idxs[n + 1] if n + 1 < len(headline_idxs) else len(lines)
+        segment = "\n".join(lines[start:end]).strip()
+        if "Source:" in segment:
+            stories.append(segment)
     return "\n\n".join(stories)
 
 
@@ -193,6 +221,8 @@ def gather_and_summarize(last_headlines: str) -> tuple:
         f"<summary in the style above>\n"
         f"Why it matters: <1-2 sentences>\n"
         f"Source: <publication> -- <url>\n\n"
+        f"The emoji goes INSIDE the ** markers, and the (<date>) at the end "
+        f"of the headline line is mandatory.\n\n"
         f"Aim for 6-9 stories total: around 6 in a quiet fortnight, up to 9 "
         f"when there is genuinely a lot worth covering. Quality over filling a "
         f"quota — never pad to reach 9.\n\n"
@@ -258,19 +288,17 @@ def gather_and_summarize(last_headlines: str) -> tuple:
 
 
 def extract_headlines(summaries: str) -> str:
-    """Pull just the bold headline lines out, to remember for next week.
+    """Pull just the headline lines out, to remember for next week.
 
-    Runs on the filtered STORIES only — honorable mentions are plain "-"
-    lines and never reach this function, so a near-miss this edition stays
-    eligible to be a full story next edition.
+    Uses the same headline-shape test as the story filter (v3), so it works
+    whether or not the model put the emoji inside the bold markers. Runs on
+    the filtered STORIES only — honorable mentions are plain "-" lines and
+    never reach this function, so a near-miss this edition stays eligible to
+    be a full story next edition.
     """
-    lines = []
-    for line in summaries.splitlines():
-        stripped = line.strip()
-        # Headlines are the lines we asked to wrap in ** ** at the start.
-        if stripped.startswith("**"):
-            lines.append(stripped)
-    return "\n".join(lines)
+    return "\n".join(
+        line.strip() for line in summaries.splitlines() if is_headline(line)
+    )
 
 
 def synthesize(summaries: str) -> str:
@@ -357,7 +385,9 @@ def send_to_telegram(text: str) -> None:
         resp = requests.post(
             url,
             data={"chat_id": chat_id, "text": chunk},
-            timeout=30,
+            # 60s: one observed timeout at 30s (2026-07-06). Longer would
+            # slow down noticing a real outage; 60 absorbs a slow moment.
+            timeout=60,
         )
         if resp.status_code != 200:
             print(f"(Telegram send failed on part {i}/{len(chunks)}: "
@@ -393,11 +423,16 @@ def main() -> None:
         f"## Stories\n\n{summaries}\n\n"
         f"## Synthesis\n\n{synthesis}\n"
     )
-    
     if mentions:
         digest += f"\n## Honorable Mentions\n\n{mentions}\n"
-    # Save a dated file next to the script (terminal shows status lines only;
-    # the full digest lives in the file and on Telegram).
+
+    # Forced runs are test runs: show the full digest in the terminal so it
+    # can be read (and copy-pasted for feedback) without opening the file.
+    # Scheduled runs stay quiet -- status lines only.
+    if forced:
+        print(digest)
+
+    # Save a dated file next to the script.
     out_path = os.path.join(HERE, f"digest-{today}.md")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(digest)
