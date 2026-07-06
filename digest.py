@@ -20,12 +20,13 @@ the off-weeks using BIWEEKLY_ANCHOR below. Run manually anytime with
 `python digest.py --force` to bypass the skip.
 
 Your API key is NEVER written in this file. It is read from a .env file that
-you keep out of git. See .env.example and .gitignore.
+you keep out of git (locally) or from GitHub Actions Secrets (in the cloud).
 """
 
 import os
 import re
 import sys
+import time
 from datetime import date, timedelta
 
 import requests
@@ -67,10 +68,9 @@ STYLE_INSTRUCTION = (
 )
 
 # Gather model. Sonnet follows the format rules and the date window far more
-# reliably (a Haiku A/B run on 2026-07-06 violated the date cutoff on half
-# its stories and broke the output format); token cost is ~3x Haiku
-# (~$1/run vs ~$0.22 -- search fees are flat either way). Reverting is
-# exactly this: swap which line is commented out.
+# reliably (two Haiku A/B runs in July 2026 each violated the explicit date
+# cutoff); token cost is ~3x Haiku (~$1/run vs ~$0.22 -- search fees are
+# flat either way). Reverting is exactly this: swap which line is commented.
 SEARCH_MODEL = "claude-sonnet-4-6"
 # SEARCH_MODEL = "claude-haiku-4-5-20251001"   # cheaper, weaker instruction-following
 
@@ -96,14 +96,74 @@ MENTIONS_SENTINEL = "---HONORABLE MENTIONS---"
 # but NOT planning junk like:          **SpaceX IPO** - Within 14 days
 # (no trailing parenthesized date). Anchoring on the SHAPE of a headline,
 # instead of assuming the line starts with **, is what makes the parser
-# survive small format drift -- the v2 parser assumed a ** start and was
-# silently defeated by a single emoji placed outside the bold markers.
+# survive small format drift.
 HEADLINE_RE = re.compile(r"^.{0,10}\*\*.+\*\*\s*\(.+\)\s*$")
+
+# Lines that are pure decoration/litter the model sometimes emits between
+# stories (---, ***, a stray **). Dropped from stories and mentions alike.
+JUNK_LINE_RE = re.compile(r"^\s*[-*_]{2,}\s*$")
+
+# Month names (and common abbreviations) -> month number, for parsing the
+# (date) at the end of headlines.
+_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5,
+    "june": 6, "july": 7, "august": 8, "september": 9, "october": 10,
+    "november": 11, "december": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7,
+    "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
 
 
 def is_headline(line: str) -> bool:
     """True if this line has the shape of a story headline."""
     return bool(HEADLINE_RE.match(line.strip()))
+
+
+def parse_headline_date(headline: str):
+    """Best-effort parse of the (date) at the end of a headline line.
+
+    Handles "(June 17, 2026)", "(June 2-3, 2026)" (takes the first day),
+    and ISO "(2026-06-17)". Returns a datetime.date, or None when no
+    specific day can be determined (e.g. "(June 2026)").
+
+    None means "can't tell", NOT "stale" -- callers must FAIL OPEN and keep
+    the story. Deterministically dropping good stories would be worse than
+    occasionally letting a vague-dated one through.
+    """
+    m = re.search(r"\(([^()]*)\)\s*$", headline.strip())
+    if not m:
+        return None
+    s = m.group(1)
+
+    iso = re.search(r"(20\d{2})-(\d{1,2})-(\d{1,2})", s)
+    if iso:
+        try:
+            return date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
+        except ValueError:
+            return None
+
+    year_m = re.search(r"\b(20\d{2})\b", s)
+    if not year_m:
+        return None
+    year = int(year_m.group(1))
+
+    month = None
+    for token in re.findall(r"[A-Za-z]+", s):
+        if token.lower() in _MONTHS:
+            month = _MONTHS[token.lower()]
+            break
+    if month is None:
+        return None
+
+    # First standalone 1-2 digit number is the day. In "June 2026" there is
+    # no such number (2026 is 4 digits), so month-only dates return None.
+    day_m = re.search(r"\b(\d{1,2})\b", s)
+    if not day_m:
+        return None
+    try:
+        return date(year, month, int(day_m.group(1)))
+    except ValueError:
+        return None
 
 
 def is_on_week(today: date) -> bool:
@@ -125,15 +185,27 @@ def save_headlines(headlines: str) -> None:
         f.write(headlines.strip())
 
 
-def extract_stories(text: str) -> str:
-    """Keep only real stories; drop narration and planning junk.
+def strip_junk_lines(text: str) -> str:
+    """Remove decoration-only lines (---, stray **) the model sometimes emits."""
+    return "\n".join(
+        line for line in text.splitlines() if not JUNK_LINE_RE.match(line)
+    ).strip()
 
-    Strategy (v3): find every line shaped like a headline (see HEADLINE_RE),
+
+def extract_stories(text: str, cutoff: date = None) -> str:
+    """Keep only real, fresh stories; drop narration, junk, and stale news.
+
+    Strategy: find every line shaped like a headline (see HEADLINE_RE),
     carve the text into segments from one headline to the next, and keep a
-    segment only if it contains a "Source:" line. Two independent locks:
-    narration before the first headline is discarded by construction, and a
-    headline-shaped junk line without a real story under it fails the
-    Source: check.
+    segment only if it contains a "Source:" line. Narration before the
+    first headline is discarded by construction; headline-shaped junk
+    without a real story under it fails the Source: check.
+
+    If a cutoff date is given, stories whose headline date parses to BEFORE
+    the cutoff are dropped (both Haiku test runs included stale stories
+    despite an explicit cutoff in the prompt -- this makes freshness a code
+    guarantee instead of a model promise). Unparseable dates FAIL OPEN: the
+    story is kept.
 
     Fallback: if NO headline-shaped lines are found at all (severe format
     drift), keep the whole text when it mentions a source rather than
@@ -143,14 +215,21 @@ def extract_stories(text: str) -> str:
     headline_idxs = [i for i, line in enumerate(lines) if is_headline(line)]
 
     if not headline_idxs:
-        return text.strip() if "Source:" in text else ""
+        return strip_junk_lines(text) if "Source:" in text else ""
 
     stories = []
     for n, start in enumerate(headline_idxs):
         end = headline_idxs[n + 1] if n + 1 < len(headline_idxs) else len(lines)
-        segment = "\n".join(lines[start:end]).strip()
-        if "Source:" in segment:
-            stories.append(segment)
+        segment = strip_junk_lines("\n".join(lines[start:end]))
+        if "Source:" not in segment:
+            continue
+        if cutoff is not None:
+            pub = parse_headline_date(lines[start])
+            if pub is not None and pub < cutoff:
+                print(f"(Dropped stale story dated {pub}: "
+                      f"{lines[start].strip()[:70]}...)")
+                continue
+        stories.append(segment)
     return "\n\n".join(stories)
 
 
@@ -160,9 +239,9 @@ def gather_and_summarize(last_headlines: str) -> tuple:
     today = date.today().isoformat()
     # Compute the window boundary HERE, in Python. LLMs are unreliable at
     # date arithmetic ("count back 14 days"), but comparing a date against
-    # an explicit boundary date is easy for them. This is what stops
-    # month-old stories from slipping into the digest.
-    cutoff = (date.today() - timedelta(days=14)).isoformat()
+    # an explicit boundary date is easy for them.
+    cutoff_date = date.today() - timedelta(days=14)
+    cutoff = cutoff_date.isoformat()
 
     # De-dup block: only added if we have last week's headlines on file.
     dedup_block = ""
@@ -207,9 +286,10 @@ def gather_and_summarize(last_headlines: str) -> tuple:
         f"the ranking.\n\n"
         f"For each included story, apply this style:\n\n{STYLE_INSTRUCTION}\n\n"
         f"REQUIREMENTS for each story:\n"
-        f"- State the publication date. If a story was published BEFORE "
-        f"{cutoff}, drop it entirely -- do not include it. Check each story's "
-        f"date against {cutoff} before including it.\n"
+        f"- State the exact publication date (month, day, and year). If a "
+        f"story was published BEFORE {cutoff}, drop it entirely -- do not "
+        f"include it. Check each story's date against {cutoff} before "
+        f"including it.\n"
         f"- After the summary, add one labeled line: 'Why it matters: ' "
         f"followed by 1-2 sentences on the significance for the reader — "
         f"consequences, what it changes, what to watch. Do not repeat the "
@@ -217,12 +297,13 @@ def gather_and_summarize(last_headlines: str) -> tuple:
         f"- End each story with its source on its own line, formatted as: "
         f"Source: <publication name> -- <url>\n\n"
         f"Format each story as:\n"
-        f"**<one relevant emoji> <short headline>** (<date>)\n"
+        f"**<one relevant emoji> <short headline>** (<Month Day, Year>)\n"
         f"<summary in the style above>\n"
         f"Why it matters: <1-2 sentences>\n"
         f"Source: <publication> -- <url>\n\n"
-        f"The emoji goes INSIDE the ** markers, and the (<date>) at the end "
-        f"of the headline line is mandatory.\n\n"
+        f"The emoji goes INSIDE the ** markers, and the (<Month Day, Year>) "
+        f"at the end of the headline line is mandatory, with the specific "
+        f"day included.\n\n"
         f"Aim for 6-9 stories total: around 6 in a quiet fortnight, up to 9 "
         f"when there is genuinely a lot worth covering. Quality over filling a "
         f"quota — never pad to reach 9.\n\n"
@@ -282,15 +363,15 @@ def gather_and_summarize(last_headlines: str) -> tuple:
     else:
         stories_part, mentions_part = text, ""
 
-    stories = extract_stories(stories_part)
-    mentions = mentions_part.strip()
+    stories = extract_stories(stories_part, cutoff=cutoff_date)
+    mentions = strip_junk_lines(mentions_part)
     return stories, mentions
 
 
 def extract_headlines(summaries: str) -> str:
     """Pull just the headline lines out, to remember for next week.
 
-    Uses the same headline-shape test as the story filter (v3), so it works
+    Uses the same headline-shape test as the story filter, so it works
     whether or not the model put the emoji inside the bold markers. Runs on
     the filtered STORIES only — honorable mentions are plain "-" lines and
     never reach this function, so a near-miss this edition stays eligible to
@@ -349,9 +430,12 @@ def format_for_telegram(text: str) -> str:
 def send_to_telegram(text: str) -> None:
     """Send the digest to your Telegram chat, split into <4096-char chunks.
 
-    Reads TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID from the environment (.env).
-    If either is missing, prints a note and skips -- the digest still prints
-    and saves to a file, so Telegram being unconfigured never breaks a run.
+    Reads TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID from the environment.
+    If either is missing, prints a note and skips. Network hiccups get ONE
+    retry; a final failure prints a note instead of raising -- Telegram
+    trouble must never crash the run, because in GitHub Actions a crash
+    here would also skip the step that saves the de-dup memory. The digest
+    is always safe on disk by the time this runs.
     """
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
@@ -382,16 +466,31 @@ def send_to_telegram(text: str) -> None:
         chunks.append(current)
 
     for i, chunk in enumerate(chunks, 1):
-        resp = requests.post(
-            url,
-            data={"chat_id": chat_id, "text": chunk},
-            # 60s: one observed timeout at 30s (2026-07-06). Longer would
-            # slow down noticing a real outage; 60 absorbs a slow moment.
-            timeout=60,
-        )
-        if resp.status_code != 200:
-            print(f"(Telegram send failed on part {i}/{len(chunks)}: "
-                  f"{resp.status_code} {resp.text[:200]})")
+        sent = False
+        for attempt in (1, 2):   # one retry on network trouble
+            try:
+                resp = requests.post(
+                    url,
+                    data={"chat_id": chat_id, "text": chunk},
+                    # 60s: one observed timeout at 30s (2026-07-06). Longer
+                    # would slow down noticing a real outage; 60 absorbs a
+                    # slow moment.
+                    timeout=60,
+                )
+                if resp.status_code == 200:
+                    sent = True
+                    break
+                print(f"(Telegram send failed on part {i}/{len(chunks)}: "
+                      f"{resp.status_code} {resp.text[:200]})")
+                return
+            except Exception as e:
+                print(f"(Telegram network error on part {i}/{len(chunks)}, "
+                      f"attempt {attempt}: {e})")
+                if attempt == 1:
+                    time.sleep(5)
+        if not sent:
+            print("(Giving up on Telegram delivery -- the digest is still "
+                  "saved to its file.)")
             return
     print(f"Sent to Telegram in {len(chunks)} message(s).")
 
@@ -411,6 +510,14 @@ def main() -> None:
 
     print("Gathering and summarizing this week's news...\n")
     summaries, mentions = gather_and_summarize(last_headlines)
+
+    # Guard: if filtering left nothing, stop BEFORE paying for a synthesis
+    # of nothing. Exit non-zero so a cloud run shows a red X instead of a
+    # deceptive green, and so the old de-dup memory is left untouched.
+    if not summaries.strip():
+        print("ERROR: no stories survived filtering -- aborting without "
+              "synthesis. The previous headlines memory is preserved.")
+        sys.exit(1)
 
     print("Writing the comparative synthesis...\n")
     synthesis = synthesize(summaries)
@@ -437,8 +544,16 @@ def main() -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(digest)
 
-    # Remember this week's headlines so next week can skip repeats.
-    save_headlines(extract_headlines(summaries))
+    # Remember this week's headlines so next week can skip repeats -- but
+    # NEVER overwrite the memory with nothing. If headline extraction came
+    # up empty (severe format drift), keeping last edition's memory beats
+    # silently wiping it (which happened once, on 2026-07-06).
+    headlines = extract_headlines(summaries)
+    if headlines:
+        save_headlines(headlines)
+    else:
+        print("(Warning: no headlines extracted -- keeping the previous "
+              "de-dup memory instead of wiping it.)")
 
     # Deliver to your phone (markdown stripped for clean plain text).
     send_to_telegram(format_for_telegram(digest))
