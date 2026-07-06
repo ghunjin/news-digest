@@ -97,7 +97,11 @@ MENTIONS_SENTINEL = "---HONORABLE MENTIONS---"
 # (no trailing parenthesized date). Anchoring on the SHAPE of a headline,
 # instead of assuming the line starts with **, is what makes the parser
 # survive small format drift.
-HEADLINE_RE = re.compile(r"^.{0,10}\*\*.+\*\*\s*\(.+\)\s*$")
+HEADLINE_RE = re.compile(
+    r"^.{0,10}\*\*.+\*\*\s*\(.+\)\s*$"      # date after the bold (requested format)
+    r"|"
+    r"^.{0,10}\*\*.+\(.+\)\s*\*\*\s*$"      # date INSIDE the bold (Haiku drift, 2026-07-06)
+)
 
 # Lines that are pure decoration/litter the model sometimes emits between
 # stories (---, ***, a stray **). Dropped from stories and mentions alike.
@@ -130,7 +134,7 @@ def parse_headline_date(headline: str):
     the story. Deterministically dropping good stories would be worse than
     occasionally letting a vague-dated one through.
     """
-    m = re.search(r"\(([^()]*)\)\s*$", headline.strip())
+    m = re.search(r"\(([^()]*)\)\s*\**\s*$", headline.strip())
     if not m:
         return None
     s = m.group(1)
