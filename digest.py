@@ -79,7 +79,7 @@ SYNTHESIS_MODEL = "claude-sonnet-4-6"        # better at cross-event reasoning
 # The date of your FIRST run. The script only runs on days that are a whole
 # number of 14-day periods after this date; scheduled weekly, it therefore
 # fires every second week. Set this to the day you actually start.
-BIWEEKLY_ANCHOR = date(2026, 7, 8)
+BIWEEKLY_ANCHOR = date(2026, 7, 15)
 # ------------------------------------------------------------------------------
 
 # The model is told to print this exact line between the ranked stories and
@@ -423,9 +423,14 @@ def format_for_telegram(text: str) -> str:
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("#"):
-            # "# News Digest -- date" -> "NEWS DIGEST -- date" etc.
+            level = len(stripped) - len(stripped.lstrip("#"))
             title = stripped.lstrip("#").strip()
-            out_lines.append(title.upper())
+            if level == 1:
+                # The digest title, once at the top.
+                out_lines.append(f"\U0001F4F0 {title}")
+            else:
+                # Section headers: a framed line instead of ALL CAPS.
+                out_lines.append(f"\u2500\u2500\u2500\u2500\u2500  {title}  \u2500\u2500\u2500\u2500\u2500")
         else:
             out_lines.append(line.replace("**", ""))
     return "\n".join(out_lines)
